@@ -10,13 +10,16 @@ PDF 内の指定文字列をハイライト(蛍光ペン注釈)します。日�
 |---|---|---|
 | pdfplumber | MIT | 文字ごとの座標取得 |
 | pypdf | BSD-3-Clause | ハイライト注釈の書き込み |
+| rapidfuzz | MIT | あいまい一致(LLM ツール用) |
+| mcp | MIT | MCP サーバ(LLM ツール用) |
 
 (テスト用: pytest = MIT / reportlab = BSD-3 / pypdfium2 = Apache-2.0 または BSD-3)
 
 ## セットアップ
 
 ```powershell
-pip install -r requirements.txt        # 実行のみ
+pip install -r requirements.txt        # CLI / Python API のみ
+pip install -r requirements-tools.txt  # LLM ツール(MCP サーバ)も使う場合
 pip install -r requirements-dev.txt    # テストも行う場合
 ```
 
@@ -88,6 +91,55 @@ print(result.colors)     # {'吾輩': '00bfff', '猫': '00ff00'}
 - 例外: `PdfHighlightError`(PDF が読めない等)/ `PdfPasswordError`(パスワード関連)/
   引数不正は `ValueError` / `TypeError`。
 
+## LLM から使う(MCP サーバ)
+
+MCP 対応のホスト(Claude Code / Claude Desktop など)から、PDF のハイライトを Tool call で使えます。
+設計の詳細は [docs/SPEC-llm-tool-support.md](docs/SPEC-llm-tool-support.md)。
+
+**ツール(3 つ)**
+
+| ツール | 種別 | 用途 |
+|---|---|---|
+| `pdf_inspect` | 読み取り | ページ数・暗号化・テキスト層の有無・既存ハイライト数 |
+| `pdf_search` | 読み取り | 語を検索し、前後の文脈付きで候補を返す(`mode=fuzzy` で誤字・一部欠落にも近い箇所を返す) |
+| `pdf_highlight` | **書き込み** | 語、または検索候補の `ref` にハイライトを付け、新しい PDF に保存する |
+
+典型的な流れ: 語が PDF にそのまま在るなら `pdf_highlight` を 1 回。確信がなければ `pdf_search` で候補を見て、
+`ref` を `pdf_highlight` に渡す(`items` に `{"text": "…", "mode": "fuzzy"}` を指定すれば 1 回で済み、
+曖昧なときは書き込まず候補を返す)。
+
+**完全ステートレス**: どのツールも、引数・入力 PDF・設定だけで結果が決まり、呼び出し間で何も覚えていない。
+検索結果の位置は、PDF 上の実際の文字列+ページ+出現番号という自己完結の `ref`
+(例 `{"text": "吾輩", "page": 1, "nth": 2}`)で表すので、検索と書き込みを別の主体(sub agent や別の呼び出し)が行っても成り立つ。
+
+**設定例**(ホストの MCP 設定。パスは環境に合わせる)
+
+```json
+{
+  "mcpServers": {
+    "pdf-highlight": {
+      "command": "D:\\20261117_PDF_hilight\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\20261117_PDF_hilight\\pdf_highlight_mcp.py"],
+      "env": { "PDF_HIGHLIGHT_ALLOWED_DIRS": "D:\\pdfs" }
+    }
+  }
+}
+```
+
+| 環境変数 | 意味 |
+|---|---|
+| `PDF_HIGHLIGHT_ALLOWED_DIRS` | 読み書きを許すフォルダ(複数なら `;` 区切り)。**省略すると、サーバ起動時の作業フォルダだけ** |
+| `PDF_HIGHLIGHT_ALLOW_OVERWRITE` | `1` で、既存ファイルの上書きを許す(既定: 許さない) |
+| `PDF_HIGHLIGHT_MAX_MB` / `_MAX_PAGES` / `_TIMEOUT` | 入力サイズ(既定 100)/ ページ数(2000)/ 1 呼び出しの秒数(60)の上限 |
+| `PDF_HIGHLIGHT_PASSWORD` | 暗号化 PDF のパスワード(会話に出さずに済む) |
+
+**安全装置**: 許可フォルダの外は読み書きできない / 入力と同じパスには書かない / 既存ファイルは上書きしない /
+一致が 50 件を超える語、1 回で 200 件を超える書き込みは拒否 / 最良候補と 2 位の差が小さいあいまい指定は書き込まず候補を返す /
+同じハイライトを再実行しても重複しない / エラーは `{"ok":false,"error":{code,message,hint}}` で返る。
+
+**現時点の未対応**(仕様書の P2 以降): 本文の取得(`pdf_read_text`)、始点と終点で一節を指定、
+`pdf_clear_highlights`、語境界(`whole_word`)、ページまたぎの検索。
+
 ## 照合ルール
 
 - 空白・改行は無視して照合する → 行をまたぐ文字列も一致する。ハイライトは行ごとの矩形に分かれた 1 つの注釈になる。
@@ -113,3 +165,5 @@ python -m pytest tests -q
 
 通常のページ、改行またぎ、ページまたぎ、全角/半角、濁点、MediaBox 原点のずれ、ページ回転(90/180/270 度)、
 暗号化 PDF、入出力形式、CLI を検証している(注釈位置は描画した画像で確認)。
+LLM ツール層は、`ref` の往復(検索した候補が必ず同じ箇所に戻る)、別プロセスでの検索→書き込み、
+パス制限、上限、エラーコード、MCP の実接続(サーバを子プロセスで起動し公式クライアントで呼ぶ)を検証している。

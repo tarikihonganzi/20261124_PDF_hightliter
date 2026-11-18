@@ -1,4 +1,4 @@
--r requirements.txt
+-r requirements-tools.txt
 # For tests (used to generate and render test PDFs)
 pytest>=8.0
 reportlab>=4.0      # BSD-3

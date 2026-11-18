@@ -32,12 +32,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
 import os
+import re
 import sys
+import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping, NamedTuple, Optional, Sequence, Union
@@ -46,15 +50,23 @@ import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Highlight
 from pypdf.errors import PdfReadError
-from pypdf.generic import ArrayObject, FloatObject
+from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "HighlightMatch",
     "HighlightResult",
     "PdfHighlightError",
     "PdfPasswordError",
+    "PdfPasswordRequired",
+    "PdfPasswordWrong",
+    "PdfRefError",
+    "PdfTimeoutError",
+    "PdfDocument",
+    "Candidate",
+    "SearchResult",
+    "HighlightReport",
     "highlight_pdf",
     "main",
 ]
@@ -90,6 +102,22 @@ class PdfHighlightError(Exception):
 
 class PdfPasswordError(PdfHighlightError):
     """暗号化 PDF でパスワードが未指定、または誤っている。"""
+
+
+class PdfPasswordRequired(PdfPasswordError):
+    """暗号化 PDF だが、パスワードが指定されていない。"""
+
+
+class PdfPasswordWrong(PdfPasswordError):
+    """パスワードが誤っている。"""
+
+
+class PdfRefError(PdfHighlightError):
+    """位置指定 ``ref`` の形式が不正。"""
+
+
+class PdfTimeoutError(PdfHighlightError):
+    """処理時間の上限を超えた。"""
 
 
 @dataclass(frozen=True)
@@ -290,27 +318,34 @@ def _extract_glyphs(
             raise PdfHighlightError(
                 f"ページ数が一致しません(pdfplumber={len(pdf.pages)}, pypdf={len(mediaboxes)})"
             )
-        for index, page in enumerate(pdf.pages):
-            rotation = int(page.rotation) % 360
-            if rotation not in (0, 90, 180, 270):
-                rotation = 0
-            geometries.append(_PageGeometry(mediaboxes[index], rotation, float(page.height)))
-            left, top0 = float(page.bbox[0]), float(page.bbox[1])
-            pages.append(
-                [
-                    _Glyph(
-                        c["text"],
-                        float(c["x0"]) - left,
-                        float(c["top"]) - top0,
-                        float(c["x1"]) - left,
-                        float(c["bottom"]) - top0,
-                        index,
-                    )
-                    for c in page.chars
-                ]
-            )
-            page.flush_cache()
+        for index in range(len(pdf.pages)):
+            glyphs, geo = _extract_page(pdf, index, mediaboxes[index])
+            pages.append(glyphs)
+            geometries.append(geo)
     return pages, geometries
+
+
+def _extract_page(pdf: "pdfplumber.PDF", index: int, mediabox: _MediaBox) -> tuple[list[_Glyph], _PageGeometry]:
+    """1 ページ分の文字と、座標変換用のページ情報を取り出す(``_extract_glyphs`` の 1 ページ版)。"""
+    page = pdf.pages[index]
+    rotation = int(page.rotation) % 360
+    if rotation not in (0, 90, 180, 270):
+        rotation = 0
+    geo = _PageGeometry(mediabox, rotation, float(page.height))
+    left, top0 = float(page.bbox[0]), float(page.bbox[1])
+    glyphs = [
+        _Glyph(
+            c["text"],
+            float(c["x0"]) - left,
+            float(c["top"]) - top0,
+            float(c["x1"]) - left,
+            float(c["bottom"]) - top0,
+            index,
+        )
+        for c in page.chars
+    ]
+    page.flush_cache()
+    return glyphs, geo
 
 
 class _Sequence(NamedTuple):
@@ -400,7 +435,14 @@ def _find_matches(
     return found, occurrence
 
 
-def _add_annotation(writer: PdfWriter, match: HighlightMatch) -> None:
+def _add_annotation(
+    writer: PdfWriter,
+    match: HighlightMatch,
+    *,
+    name: Optional[str] = None,
+    author: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> None:
     quads: list[FloatObject] = []
     for x0, y0, x1, y1 in match.rects:
         # QuadPoints の順序: 左上, 右上, 左下, 右下(Acrobat 等の慣例)
@@ -417,6 +459,12 @@ def _add_annotation(writer: PdfWriter, match: HighlightMatch) -> None:
         highlight_color=match.color,
         printing=True,
     )
+    if name:
+        annotation[NameObject("/NM")] = TextStringObject(name)
+    if author:
+        annotation[NameObject("/T")] = TextStringObject(author)
+    if comment:
+        annotation[NameObject("/Contents")] = TextStringObject(comment)
     writer.add_annotation(page_number=match.page - 1, annotation=annotation)
 
 
@@ -495,9 +543,9 @@ def highlight_pdf(
     except PdfReadError as e:
         raise PdfHighlightError(f"PDF を読み込めません: {e}") from e
     if reader.is_encrypted and reader.decrypt(password or "") == 0:
-        raise PdfPasswordError(
-            "パスワードが誤っています" if password else "PDF が暗号化されています。パスワードを指定してください"
-        )
+        if password:
+            raise PdfPasswordWrong("パスワードが誤っています")
+        raise PdfPasswordRequired("PDF が暗号化されています。パスワードを指定してください")
 
     # --- 文字座標の取得 ---
     mediaboxes = [
@@ -562,6 +610,575 @@ def highlight_pdf(
 
     logger.info("ハイライト完了: %s", result.counts())
     return result
+
+
+# --------------------------------------------------------------------------- #
+# PdfDocument: 検索・位置指定(ref)・書き込み
+#
+# LLM の Tool call から使うための API(仕様: docs/SPEC-llm-tool-support.md)。
+# 呼び出し間で状態を持たない: PdfDocument は 1 回の呼び出しの間だけ使い、結果は
+# 「引数と PDF の内容」だけで決まる。検索結果の位置は、自己完結の ref で表す。
+# --------------------------------------------------------------------------- #
+_FUZZY_MIN_LEN = 4  # 正規化後の長さがこれ未満の語は、あいまい一致をしない(ノイズが多い)
+_FUZZY_MARGIN = 5  # select="best" で、最良と 2 位の点差がこれ未満なら ambiguous(書き込まない)
+_SUGGEST_MIN_SCORE = 70  # 一致 0 件のときの「もしかして」候補の下限
+_MAX_QUERY_CHARS = 500
+_MAX_COMMENT_CHARS = 500
+_DISPLAY_MAX = 82  # 候補の表示用文字列の最大長(先頭 40 + … + 末尾 40)
+
+
+def _find_all(text: str, key: str, overlap: bool) -> list[int]:
+    """text 内の key の出現位置。overlap=True なら重なる出現(1 文字ずつずらす)も数える。"""
+    out: list[int] = []
+    pos = 0
+    while (i := text.find(key, pos)) != -1:
+        out.append(i)
+        pos = i + 1 if overlap else i + len(key)
+    return out
+
+
+def _clean(text: str) -> str:
+    """表示用に整える: 制御文字を除き、連続する空白を 1 つにする。
+
+    PDF 由来の文字列は信頼できない入力なので、LLM に返す前に必ずこれを通す。
+    """
+    text = "".join(ch for ch in text if ch.isspace() or unicodedata.category(ch)[0] != "C")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _shorten(text: str, limit: int = _DISPLAY_MAX) -> str:
+    return text if len(text) <= limit else text[:40] + "…" + text[-40:]
+
+
+def _span_text(glyphs: Sequence[_Glyph], ids: Sequence[int]) -> str:
+    """一致範囲の表示用文字列。範囲の途中にある空白グリフも含める(照合では無視される空白)。"""
+    return _clean("".join(g.text for g in glyphs[ids[0] : ids[-1] + 1]))
+
+
+def _fuzzy_spans(text: str, key: str, min_score: int) -> list[tuple[int, int, int]]:
+    """text 内で key に近い範囲 ``(開始, 終了, 類似度 0-100)`` を、類似度の高い順に返す。
+
+    窓に分けて rapidfuzz で探し、範囲の両端のうち key と対応しない文字を除いてから類似度を
+    計算し直す(素の結果は端に余計な文字が付くため)。重なる範囲の整理は呼び出し側で行う。
+    """
+    try:
+        from rapidfuzz import fuzz
+        from rapidfuzz.distance import Levenshtein
+    except ImportError as e:  # pragma: no cover - 環境依存
+        raise PdfHighlightError("あいまい一致には rapidfuzz が必要です(pip install rapidfuzz)") from e
+
+    n, m = len(text), len(key)
+    if m < _FUZZY_MIN_LEN or n < m:
+        return []
+    if fuzz.partial_ratio(key, text, score_cutoff=min_score) < min_score:
+        return []  # このページに近い箇所は無い(安価な足切り)
+    window = max(int(m * 1.5), m + 4)
+    stride = max(m // 2, 1)
+    starts = list(range(0, max(n - window, 0) + 1, stride))
+    if starts[-1] + window < n:
+        starts.append(n - window)
+    found: dict[tuple[int, int], int] = {}
+    for st in starts:
+        al = fuzz.partial_ratio_alignment(key, text[st : st + window], score_cutoff=min_score)
+        if al is None or al.score < min_score:
+            continue
+        s, e = st + al.dest_start, st + al.dest_end
+        equal = [op for op in Levenshtein.opcodes(key, text[s:e]) if op.tag == "equal"]
+        if not equal:
+            continue
+        s, e = s + equal[0].dest_start, s + equal[-1].dest_end
+        score = int(round(fuzz.ratio(key, text[s:e])))
+        if score >= min_score and score > found.get((s, e), -1):
+            found[(s, e)] = score
+    return sorted(((s, e, sc) for (s, e), sc in found.items()), key=lambda x: (-x[2], x[0]))
+
+
+class _Hit(NamedTuple):
+    """1 件の一致。照合列上の範囲と、元グリフ(ページ内の添字)で表す。"""
+
+    page: int  # 0 始まり
+    fs: int  # 照合列上の範囲 [fs, fe)
+    fe: int
+    ids: tuple[int, ...]  # 元グリフの添字(読み順・重複なし)
+    score: int
+    match: str  # "exact" / "fuzzy"
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """検索候補 1 件。``ref`` はそのまま highlight の項目に渡せる(自己完結の位置指定)。"""
+
+    ref: dict
+    query: int  # queries の添字
+    page: int  # 1 始まり
+    score: int
+    match: str
+    text: str  # PDF 上の実際の文字列(表示用。長いときは省略)
+    length: int
+    before: str
+    after: str
+    position: str  # "upper" / "middle" / "lower"
+    glyph_ids: tuple[int, ...] = ()  # 内部用(テスト・デバッグ)。to_dict には含めない
+
+    def to_dict(self, brief: bool = False) -> dict:
+        d = {"ref": self.ref, "page": self.page, "score": self.score, "text": self.text,
+             "before": self.before, "after": self.after}
+        if not brief:
+            d.update({"query": self.query, "match": self.match, "length": self.length,
+                      "position": self.position})
+        return d
+
+
+@dataclass
+class SearchResult:
+    candidates: list[Candidate] = field(default_factory=list)
+    queries: list[dict] = field(default_factory=list)  # [{index, found, best_score}]
+    total_found: int = 0
+    truncated: bool = False
+    warnings: list[str] = field(default_factory=list)
+    searched_pages: int = 0  # 検索対象にしたページ数
+    empty_pages: list[int] = field(default_factory=list)  # そのうちテキスト層の無いページ(1 始まり)
+
+
+@dataclass
+class HighlightReport:
+    results: list[dict] = field(default_factory=list)  # 項目ごとの結果(status 付き)
+    applied: int = 0  # 注釈を付けた項目数
+    annotations: int = 0  # 追加した注釈の数
+    data: Optional[bytes] = None  # 書き出した PDF。1 件も付けなかった / dry_run のときは None
+    run_id: str = ""
+    fingerprint: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+class PdfDocument:
+    """1 回の呼び出しの間だけ使う PDF の窓口。文字の抽出は、必要になったページだけ行う。"""
+
+    def __init__(self, source: PdfSource, password: Optional[str] = None, *, deadline: Optional[float] = None):
+        data = _read_source(source)
+        self._data = data
+        self._password = password
+        self.deadline = deadline  # time.monotonic() の値。超えると PdfTimeoutError
+        self.fingerprint = hashlib.sha256(data).hexdigest()[:12]
+        try:
+            reader = PdfReader(io.BytesIO(data))
+        except PdfReadError as e:
+            raise PdfHighlightError(f"PDF を読み込めません: {e}") from e
+        except Exception as e:
+            raise PdfHighlightError(f"PDF を読み込めません: {e}") from e
+        self.encrypted = bool(reader.is_encrypted)
+        if self.encrypted and reader.decrypt(password or "") == 0:
+            if password:
+                raise PdfPasswordWrong("パスワードが誤っています")
+            raise PdfPasswordRequired("PDF が暗号化されています。パスワードを指定してください")
+        self._reader = reader
+        try:
+            self._mediaboxes = [
+                _MediaBox(float(p.mediabox.left), float(p.mediabox.bottom),
+                          float(p.mediabox.width), float(p.mediabox.height))
+                for p in reader.pages
+            ]
+        except Exception as e:
+            raise PdfHighlightError(f"PDF のページ情報を読み込めません: {e}") from e
+        self.page_count = len(self._mediaboxes)
+        self._plumber: Optional["pdfplumber.PDF"] = None
+        self._pages: dict[int, tuple[list[_Glyph], _PageGeometry]] = {}
+        self._seqs: dict[tuple[int, bool], _Sequence] = {}  # 1 回の呼び出しの中だけのメモ
+
+    @classmethod
+    def open(cls, source: PdfSource, password: Optional[str] = None, *, deadline: Optional[float] = None) -> "PdfDocument":
+        return cls(source, password, deadline=deadline)
+
+    def close(self) -> None:
+        if self._plumber is not None:
+            self._plumber.close()
+            self._plumber = None
+
+    def __enter__(self) -> "PdfDocument":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # ---- 内部: ページの抽出 ---------------------------------------------- #
+    def _check_deadline(self) -> None:
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            raise PdfTimeoutError("処理時間の上限を超えました")
+
+    def _page(self, index: int) -> tuple[list[_Glyph], _PageGeometry]:
+        self._check_deadline()
+        if index not in self._pages:
+            try:
+                if self._plumber is None:
+                    self._plumber = pdfplumber.open(io.BytesIO(self._data), password=self._password)
+                    if len(self._plumber.pages) != self.page_count:
+                        raise PdfHighlightError(
+                            f"ページ数が一致しません(pdfplumber={len(self._plumber.pages)}, pypdf={self.page_count})"
+                        )
+                self._pages[index] = _extract_page(self._plumber, index, self._mediaboxes[index])
+            except PdfHighlightError:
+                raise
+            except Exception as e:  # pdfminer は多様な例外を出すためここでまとめて変換する
+                raise PdfHighlightError(f"PDF のテキストを解析できません: {e}") from e
+        return self._pages[index]
+
+    def _seq(self, index: int, ignore_case: bool) -> _Sequence:
+        key = (index, ignore_case)
+        if key not in self._seqs:
+            self._seqs[key] = _build_sequence([self._page(index)[0]], ignore_case)
+        return self._seqs[key]
+
+    def _page_indexes(self, pages: Optional[Iterable[int]]) -> list[int]:
+        if pages is None:
+            return list(range(self.page_count))
+        out: list[int] = []
+        for p in pages:
+            if isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= self.page_count:
+                raise ValueError(f"ページ番号は 1〜{self.page_count} の整数で指定してください: {p!r}")
+            out.append(p - 1)
+        return sorted(set(out))
+
+    def pages_without_text(self) -> list[int]:
+        """テキスト層の無いページ(1 始まり)。全ページを抽出するため、大きな PDF では時間がかかる。"""
+        return [i + 1 for i in range(self.page_count) if not self._page(i)[0]]
+
+    def highlight_counts(self) -> dict[str, int]:
+        """既存のハイライト注釈の数。``ours`` はこのモジュールが付けたもの(/NM が pdfhl: で始まる)。"""
+        total = ours = 0
+        for page in self._reader.pages:
+            for ref in page.get("/Annots", None) or []:
+                a = ref.get_object()
+                if a.get("/Subtype") == "/Highlight":
+                    total += 1
+                    if str(a.get("/NM", "")).startswith("pdfhl:"):
+                        ours += 1
+        return {"total": total, "ours": ours}
+
+    # ---- 検索 -------------------------------------------------------------- #
+    def _hits(self, page: int, key: str, ignore_case: bool, mode: str, min_score: int) -> list[_Hit]:
+        seq = self._seq(page, ignore_case)
+        n = len(key)
+        hits = [
+            _Hit(page, i, i + n, tuple(dict.fromkeys(seq.owners[i : i + n])), 100, "exact")
+            for i in _find_all(seq.text, key, overlap=False)
+        ]
+        if mode == "fuzzy" and n >= _FUZZY_MIN_LEN:
+            taken = [(h.fs, h.fe) for h in hits]
+            for s, e, score in _fuzzy_spans(seq.text, key, min_score):
+                if any(s < te and ts < e for ts, te in taken):
+                    continue  # 既に採用した範囲(exact を含む)と重なるものは捨てる
+                taken.append((s, e))
+                hits.append(_Hit(page, s, e, tuple(dict.fromkeys(seq.owners[s:e])), score, "fuzzy"))
+        return hits
+
+    def _make_ref(self, hit: _Hit, raw: str) -> Optional[dict]:
+        """hit を指す ref を作る。解決規則で同じ範囲に戻ることを検証し、戻らなければ None。"""
+        key = _fold_keyword(raw, False)
+        if not key:
+            return None
+        seq = self._seq(hit.page, False)
+        for nth, i in enumerate(_find_all(seq.text, key, overlap=True), 1):
+            if tuple(dict.fromkeys(seq.owners[i : i + len(key)])) == hit.ids:
+                return {"text": raw, "page": hit.page + 1, "nth": nth}
+        return None
+
+    def _candidate(self, hit: _Hit, query: int, context_chars: int) -> Optional[Candidate]:
+        glyphs, geo = self._page(hit.page)
+        raw = _span_text(glyphs, hit.ids)
+        ref = self._make_ref(hit, raw)
+        if ref is None:
+            return None
+        first, last, n = hit.ids[0], hit.ids[-1], context_chars
+        before = after = ""
+        if n > 0:
+            before = _clean("".join(g.text for g in glyphs[max(0, first - 3 * n - 3) : first]))[-n:]
+            after = _clean("".join(g.text for g in glyphs[last + 1 : last + 1 + 3 * n + 3]))[:n]
+        ratio = glyphs[first].top / geo.disp_h if geo.disp_h else 0.0
+        position = "upper" if ratio < 1 / 3 else "middle" if ratio < 2 / 3 else "lower"
+        return Candidate(
+            ref=ref, query=query, page=hit.page + 1, score=hit.score, match=hit.match,
+            text=_shorten(raw), length=len(raw), before=before, after=after, position=position,
+            glyph_ids=hit.ids,
+        )
+
+    def search(
+        self,
+        queries: Union[str, Sequence[str]],
+        *,
+        mode: str = "exact",
+        min_score: int = 80,
+        ignore_case: bool = False,
+        pages: Optional[Iterable[int]] = None,
+        limit: int = 10,
+        context_chars: int = 20,
+    ) -> SearchResult:
+        """文字列を検索し、文脈付きの候補を返す(PDF は変更しない)。
+
+        mode="exact": 正規化(NFKC・空白除去)後の部分文字列一致。
+        mode="fuzzy": exact に加え、誤字・一部欠落など近い箇所も返す(``min_score`` 以上)。
+        """
+        if mode not in ("exact", "fuzzy"):
+            raise ValueError(f"mode は exact か fuzzy を指定してください: {mode!r}")
+        qs = [queries] if isinstance(queries, str) else list(queries)
+        if not qs:
+            raise ValueError("検索する文字列が 1 つも指定されていません")
+        for q in qs:
+            if not isinstance(q, str):
+                raise TypeError(f"検索する文字列は str で指定してください: {q!r}")
+            if not any(not ch.isspace() for ch in q):
+                raise ValueError(f"空白のみ、または空の文字列は指定できません: {q!r}")
+            if len(q) > _MAX_QUERY_CHARS:
+                raise ValueError(f"検索する文字列は {_MAX_QUERY_CHARS} 文字以内にしてください")
+        if not 0 < limit <= 50:
+            raise ValueError("limit は 1〜50 で指定してください")
+        page_idx = self._page_indexes(pages)
+
+        result = SearchResult()
+        for qi, q in enumerate(qs):
+            key = _fold_keyword(q, ignore_case)
+            if mode == "fuzzy" and len(key) < _FUZZY_MIN_LEN:
+                result.warnings.append(f"fuzzy_skipped_short_query: 「{_shorten(q, 20)}」は短いため完全一致のみ")
+            hits: list[_Hit] = []
+            for p in page_idx:
+                hits += self._hits(p, key, ignore_case, mode, min_score)
+            hits.sort(key=lambda h: (-h.score, h.page, h.fs))
+            result.queries.append({"index": qi, "found": len(hits), "best_score": hits[0].score if hits else 0})
+            result.total_found += len(hits)
+            if len(hits) > limit:
+                result.truncated = True
+            for h in hits[:limit]:
+                cand = self._candidate(h, qi, context_chars)
+                if cand is None:
+                    result.warnings.append("ref_unresolvable: 位置を一意に指定できない候補を 1 件除きました")
+                else:
+                    result.candidates.append(cand)
+        empty = [p + 1 for p in page_idx if not self._page(p)[0]]
+        result.searched_pages, result.empty_pages = len(page_idx), empty
+        if empty:
+            result.warnings.append(f"no_text_layer: テキスト層の無いページ(OCR が必要): {empty[:20]}")
+        return result
+
+    # ---- ref ---------------------------------------------------------------- #
+    def resolve_ref(self, ref: Mapping) -> Optional[_Hit]:
+        """ref を、PDF 上の位置に解決する。解決できなければ None(ファイルが変わった場合など)。
+
+        解決規則(照合設定に依存しない): 大小区別あり・NFKC・空白無視の exact で、
+        ``page`` のページ内の全出現(重なりを許す、読み順)のうち ``nth`` 番目。
+        """
+        if not isinstance(ref, Mapping):
+            raise PdfRefError("ref はオブジェクトで指定してください")
+        if "start" in ref or "end" in ref:
+            raise PdfRefError("start/end 形式の ref には未対応です(text 形式を使ってください)")
+        text, page, nth = ref.get("text"), ref.get("page"), ref.get("nth")
+        if not isinstance(text, str) or not any(not ch.isspace() for ch in text):
+            raise PdfRefError("ref.text は空でない文字列で指定してください")
+        for name, v in (("page", page), ("nth", nth)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise PdfRefError(f"ref.{name} は 1 以上の整数で指定してください: {v!r}")
+        if page > self.page_count:
+            return None
+        key = _fold_keyword(text, False)
+        seq = self._seq(page - 1, False)
+        occ = _find_all(seq.text, key, overlap=True)
+        if nth > len(occ):
+            return None
+        i = occ[nth - 1]
+        return _Hit(page - 1, i, i + len(key), tuple(dict.fromkeys(seq.owners[i : i + len(key)])), 100, "exact")
+
+    # ---- 書き込み ------------------------------------------------------------ #
+    def _plan_item(
+        self, item: Mapping, ignore_case: bool, max_matches: int
+    ) -> tuple[str, dict, list[_Hit]]:
+        """項目 1 つを解決する。戻り値は (status, 追加情報, 一致)。status が "ready" のときだけ書き込む。"""
+        if not isinstance(item, Mapping):
+            raise TypeError(f"items の各要素はオブジェクトで指定してください: {item!r}")
+        if ("ref" in item) == ("text" in item):
+            raise ValueError("各項目には ref か text のどちらか一方だけを指定してください")
+
+        if "ref" in item:
+            hit = self.resolve_ref(item["ref"])
+            label = item["ref"].get("text", "") if isinstance(item["ref"], Mapping) else ""
+            if hit is None:
+                return "not_found", self._suggest(label, ignore_case, None), []
+            return "ready", {}, [hit]
+
+        text = item["text"]
+        if not isinstance(text, str) or not any(not ch.isspace() for ch in text):
+            raise ValueError("text は空でない文字列で指定してください")
+        if len(text) > _MAX_QUERY_CHARS:
+            raise ValueError(f"text は {_MAX_QUERY_CHARS} 文字以内にしてください")
+        mode = item.get("mode", "exact")
+        if mode not in ("exact", "fuzzy"):
+            raise ValueError(f"mode は exact か fuzzy を指定してください: {mode!r}")
+        pages = item.get("pages")
+        page_idx = self._page_indexes(pages)
+        key = _fold_keyword(text, ignore_case)
+        occurrence = item.get("occurrence")
+
+        if mode == "exact":
+            min_score = 100
+        else:
+            if occurrence is not None:
+                raise ValueError("occurrence は mode=exact のときだけ指定できます")
+            min_score = item.get("min_score", 85)
+            if isinstance(min_score, bool) or not isinstance(min_score, int) or not 70 <= min_score <= 100:
+                raise ValueError("min_score は 70〜100 の整数で指定してください")
+        select = item.get("select", "best")
+        if select not in ("best", "all"):
+            raise ValueError(f"select は best か all を指定してください: {select!r}")
+
+        hits: list[_Hit] = []
+        for p in page_idx:
+            hits += self._hits(p, key, ignore_case, mode, min_score)
+
+        if mode == "exact":
+            if occurrence is not None:
+                if (not isinstance(occurrence, list) or not occurrence
+                        or any(isinstance(o, bool) or not isinstance(o, int) or o < 1 for o in occurrence)):
+                    raise ValueError("occurrence は 1 以上の整数の配列で指定してください")
+                hits = [hits[o - 1] for o in sorted(set(occurrence)) if o <= len(hits)]
+        else:
+            hits.sort(key=lambda h: (-h.score, h.page, h.fs))
+            if select == "best" and hits:
+                if len(hits) >= 2 and hits[0].score - hits[1].score < _FUZZY_MARGIN:
+                    cands = [c for h in hits[:5] if (c := self._candidate(h, 0, 15))]
+                    return "ambiguous", {
+                        "hint": "最良候補と 2 位の差が小さいため書き込んでいません。candidates の ref で 1 か所を指定してください",
+                        "candidates": [c.to_dict(brief=True) for c in cands],
+                    }, []
+                hits = hits[:1]
+
+        if not hits:
+            return "not_found", self._suggest(text, ignore_case, pages), []
+        if len(hits) > max_matches:
+            dist = Counter(h.page + 1 for h in hits)
+            return "too_many_matches", {
+                "count": len(hits),
+                "pages_distribution": {str(p): dist[p] for p in sorted(dist)[:20]},
+                "hint": "pages か occurrence で絞るか、より長い語を指定してください",
+            }, []
+        return "ready", {}, hits
+
+    def _suggest(self, text: str, ignore_case: bool, pages: Optional[Iterable[int]]) -> dict:
+        """一致 0 件のときの「もしかして」候補(近い箇所の上位 3 件)。書き込みには使われない。"""
+        info: dict = {}
+        if len(_fold_keyword(text, ignore_case)) >= _FUZZY_MIN_LEN:
+            res = self.search([text], mode="fuzzy", min_score=_SUGGEST_MIN_SCORE, ignore_case=ignore_case,
+                              pages=pages, limit=3, context_chars=15)
+            if res.candidates:
+                info["suggestions"] = [c.to_dict(brief=True) for c in res.candidates]
+        if "suggestions" not in info:
+            info["hint"] = "一致する箇所も、近い箇所も見つかりませんでした。pdf_search で語を確かめてください"
+        return info
+
+    def highlight(
+        self,
+        items: Sequence[Mapping],
+        *,
+        color: str = DEFAULT_COLOR,
+        ignore_case: bool = True,
+        max_matches_per_item: int = 50,
+        max_highlights: int = 200,
+        author: str = "pdf_highlight",
+        dry_run: bool = False,
+    ) -> HighlightReport:
+        """項目ごとにハイライトを付けた PDF(bytes)を作る。入力は変更しない。
+
+        項目は ``{"ref": {...}}``(pdf_search の候補)か ``{"text": "...", ...}``。
+        一致が多すぎる項目や曖昧な項目は書き込まず、理由を ``status`` で返す(部分成功を許す)。
+        """
+        if isinstance(items, (str, bytes)) or not isinstance(items, Sequence) or not items:
+            raise ValueError("items は 1 件以上の配列で指定してください")
+        default_hex = _parse_color(color)
+        run_id = hashlib.sha256(
+            json.dumps([self.fingerprint, default_hex, ignore_case, list(items)], sort_keys=True,
+                       ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()[:8]
+
+        report = HighlightReport(run_id=run_id, fingerprint=self.fingerprint)
+        plan: list[tuple[int, list[_Hit], str, Optional[str]]] = []
+        used = 0
+        for idx, item in enumerate(items):
+            status, info, hits = self._plan_item(item, ignore_case, max_matches_per_item)
+            item_hex = _parse_color(item["color"]) if item.get("color") else default_hex
+            comment = item.get("comment")
+            if comment is not None and (not isinstance(comment, str) or len(comment) > _MAX_COMMENT_CHARS):
+                raise ValueError(f"comment は {_MAX_COMMENT_CHARS} 文字以内の文字列で指定してください")
+            res = {"item": idx, "status": status, **info}
+            if status == "ready":
+                if used + len(hits) > max_highlights:
+                    res = {"item": idx, "status": "too_many_matches", "count": len(hits),
+                           "hint": f"1 回の書き込み上限({max_highlights} 件)を超えるため書き込みません。項目を分けて呼び出してください"}
+                else:
+                    used += len(hits)
+                    plan.append((idx, hits, item_hex, _clean(comment) if comment else None))
+            report.results.append(res)
+
+        if not plan:
+            return report
+
+        writer = None if dry_run else PdfWriter(clone_from=self._reader)
+        serial = 0
+        for idx, hits, item_hex, comment in plan:
+            res = report.results[idx]
+            added = dup = 0
+            pages_hit: list[int] = []
+            matched: list[str] = []
+            for hit in hits:
+                glyphs, geo = self._page(hit.page)
+                gs = [glyphs[i] for i in hit.ids]
+                raw = _span_text(glyphs, hit.ids)
+                if len(matched) < 5:
+                    matched.append(_shorten(raw, 40))
+                if hit.page + 1 not in pages_hit:
+                    pages_hit.append(hit.page + 1)
+                if writer is None:
+                    added += 1
+                    continue
+                match = HighlightMatch(keyword=raw, occurrence=0, page=hit.page + 1,
+                                       rects=tuple(_line_rects(gs, geo)), text=raw, color=item_hex)
+                if _has_same_highlight(writer, hit.page, match.rects, item_hex):
+                    dup += 1
+                    continue
+                serial += 1
+                _add_annotation(writer, match, name=f"pdfhl:{run_id}:{serial}", author=author, comment=comment)
+                added += 1
+            if added:
+                res.update(status="would_apply" if dry_run else "applied", count=added, pages=sorted(pages_hit),
+                           matched=matched)
+                report.applied += 1
+                report.annotations += added
+            else:
+                res.update(status="skipped_duplicate", count=0)
+            if dup and added:
+                res["duplicates_skipped"] = dup
+
+        if writer is not None and report.annotations:
+            buf = io.BytesIO()
+            writer.write(buf)
+            report.data = buf.getvalue()
+        return report
+
+
+def _has_same_highlight(writer: PdfWriter, page0: int, rects: Sequence[Rect], color_hex: str) -> bool:
+    """同じページに、同じ位置・同じ色のハイライトが既にあるか(再実行で重複させないため)。"""
+    quads: list[float] = []
+    for x0, y0, x1, y1 in rects:
+        quads += [x0, y1, x1, y1, x0, y0, x1, y0]
+    want_c = [int(color_hex[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    for ref in writer.pages[page0].get("/Annots", None) or []:
+        a = ref.get_object()
+        if a.get("/Subtype") != "/Highlight":
+            continue
+        try:
+            qp = [float(v) for v in a.get("/QuadPoints", [])]
+            c = [float(v) for v in a.get("/C", [])]
+        except (TypeError, ValueError):
+            continue
+        if (len(qp) == len(quads) and all(abs(p - q) <= 0.5 for p, q in zip(qp, quads))
+                and len(c) == 3 and all(abs(p - q) <= 0.02 for p, q in zip(c, want_c))):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #

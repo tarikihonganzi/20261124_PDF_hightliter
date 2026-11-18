@@ -1,0 +1,5 @@
+# For the LLM tool layer / MCP server (all permissive: MIT)
+# Comments are kept ASCII because pip on Windows reads this file as cp932.
+-r requirements.txt
+rapidfuzz>=3.10     # MIT (tested with 3.14.6) fuzzy matching
+mcp>=2.3,<3         # MIT (tested with 2.3.0)  MCP server (pdf_highlight_mcp.py)
