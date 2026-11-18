@@ -1,0 +1,4 @@
+# Runtime dependencies (both permissive: MIT / BSD-3-Clause)
+# Comments are kept ASCII because pip on Windows reads this file as cp932.
+pdfplumber>=0.11    # MIT    (tested with 0.11.10)
+pypdf>=6.0          # BSD-3  (tested with 7.1.0)
