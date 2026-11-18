@@ -11,6 +11,7 @@
       ハイライトは行ごとの矩形(QuadPoints)に分けて 1 つの注釈として付与する。
     * 縦書きは非対応(横書き専用)。
     * ``cross_page=True`` でページをまたぐ文字列も検索できる。
+    * キーワードごとに色を変えられる(青・黄など複数色を 1 回の実行で付与できる)。
 
 他スクリプトからの利用例::
 
@@ -19,9 +20,13 @@
     result = highlight_pdf("in.pdf", "out.pdf", ["吾輩", "Hello World"], color="FFFF00")
     print(result.counts())      # {'吾輩': 3, 'Hello World': 1}
 
+    # キーワードごとに色を指定する(dict、または (キーワード, 色) を含むリスト)
+    highlight_pdf("in.pdf", "out.pdf", {"吾輩": "blue", "猫": "yellow"})
+
 コマンドライン例::
 
     python pdf_highlight.py in.pdf 吾輩 "Hello World" -o out.pdf
+    python pdf_highlight.py in.pdf -s blue 吾輩 -s yellow 猫 -o out.pdf
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Iterable, NamedTuple, Optional, Sequence, Union
+from typing import BinaryIO, Iterable, Mapping, NamedTuple, Optional, Sequence, Union
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
@@ -43,7 +48,7 @@ from pypdf.annotations import Highlight
 from pypdf.errors import PdfReadError
 from pypdf.generic import ArrayObject, FloatObject
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "HighlightMatch",
@@ -69,6 +74,8 @@ _NAMED_COLORS = {
     "pink": "FF69B4",
     "orange": "FFA500",
     "red": "FF0000",
+    "blue": "00BFFF",  # 純色の青(0000FF)だと文字が読めなくなるため、明るい青にしている
+    "purple": "DA70D6",
 }
 # 同一行とみなす際、直前の文字より x が戻ってよい許容量(pt)
 _LINE_X_TOLERANCE = 1.0
@@ -98,6 +105,7 @@ class HighlightMatch:
     page: int  # 1 始まり
     rects: tuple[Rect, ...]  # 行ごとの矩形
     text: str  # PDF から取り出した一致部分の文字列
+    color: str = DEFAULT_COLOR  # 付与した色(6 桁小文字 16 進)
 
 
 @dataclass
@@ -109,6 +117,7 @@ class HighlightResult:
     output_path: Optional[Path] = None
     data: Optional[bytes] = None  # output=None のとき、書き出した PDF のバイト列
     pages_without_text: list[int] = field(default_factory=list)  # テキスト層の無いページ(1 始まり)
+    colors: dict[str, str] = field(default_factory=dict)  # キーワード -> 色(6 桁小文字 16 進)
 
     def counts(self) -> dict[str, int]:
         """キーワードごとの一致件数(ページまたぎは 1 件として数える)。"""
@@ -125,6 +134,7 @@ class HighlightResult:
             "output": str(self.output_path) if self.output_path else None,
             "total": self.total,
             "counts": self.counts(),
+            "colors": self.colors,
             "pages_without_text": self.pages_without_text,
             "matches": [
                 {
@@ -133,6 +143,7 @@ class HighlightResult:
                     "page": m.page,
                     "rects": [list(r) for r in m.rects],
                     "text": m.text,
+                    "color": m.color,
                 }
                 for m in self.matches
             ],
@@ -187,21 +198,44 @@ def _read_source(src: PdfSource) -> bytes:
     return Path(src).read_bytes()  # type: ignore[arg-type]
 
 
-def _normalize_keywords(keywords: Union[str, Iterable[str]]) -> list[str]:
+KeywordsArg = Union[str, Mapping[str, Optional[str]], Iterable[Union[str, tuple]]]
+
+
+def _normalize_keywords(keywords: KeywordsArg, default_color: str) -> list[tuple[str, str]]:
+    """キーワード指定を ``[(キーワード, 色の 6 桁 16 進), ...]`` に正規化する。
+
+    受け付ける形: ``"語"`` / ``["語", ...]`` / ``{"語": "blue", ...}`` /
+    ``[("語", "blue"), "語2", ...]``。色が省略(または None)の語は ``default_color`` になる。
+    同じ語の重複は除去する(順序は保持)。同じ語に異なる色を指定した場合は ValueError。
+    """
     if isinstance(keywords, str):
-        keywords = [keywords]
-    result: list[str] = []
-    for kw in keywords:
+        items: list = [keywords]
+    elif isinstance(keywords, Mapping):
+        items = list(keywords.items())
+    else:
+        items = list(keywords)
+
+    default_hex = _parse_color(default_color)
+    result: dict[str, str] = {}
+    for item in items:
+        if isinstance(item, str):
+            kw, col = item, None
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            kw, col = item
+        else:
+            raise TypeError(f"キーワードは str か (str, 色) で指定してください: {item!r}")
         if not isinstance(kw, str):
             raise TypeError(f"キーワードは str で指定してください: {kw!r}")
-        if kw not in result:  # 重複は除去(順序は保持)
-            result.append(kw)
-    if not result:
-        raise ValueError("キーワードが 1 つも指定されていません")
-    for kw in result:
+        if col is not None and not isinstance(col, str):
+            raise TypeError(f"色は str で指定してください: {col!r}")
         if not any(not ch.isspace() for ch in kw):
             raise ValueError(f"空白のみ、または空のキーワードは指定できません: {kw!r}")
-    return result
+        color_hex = _parse_color(col) if col is not None else default_hex
+        if result.setdefault(kw, color_hex) != color_hex:
+            raise ValueError(f"同じキーワードに異なる色が指定されています: {kw!r}")
+    if not result:
+        raise ValueError("キーワードが 1 つも指定されていません")
+    return list(result.items())
 
 
 class _MediaBox(NamedTuple):
@@ -335,6 +369,7 @@ def _find_matches(
     seq: _Sequence,
     keyword: str,
     key: str,
+    color: str,
     start_occurrence: int,
     geometries: Sequence[_PageGeometry],
 ) -> tuple[list[HighlightMatch], int]:
@@ -358,13 +393,14 @@ def _find_matches(
                     page=page_index + 1,
                     rects=tuple(_line_rects(gs, geometries[page_index])),
                     text="".join(g.text for g in gs),
+                    color=color,
                 )
             )
         occurrence += 1
     return found, occurrence
 
 
-def _add_annotation(writer: PdfWriter, match: HighlightMatch, color: str) -> None:
+def _add_annotation(writer: PdfWriter, match: HighlightMatch) -> None:
     quads: list[FloatObject] = []
     for x0, y0, x1, y1 in match.rects:
         # QuadPoints の順序: 左上, 右上, 左下, 右下(Acrobat 等の慣例)
@@ -378,7 +414,7 @@ def _add_annotation(writer: PdfWriter, match: HighlightMatch, color: str) -> Non
     annotation = Highlight(
         rect=bbox,
         quad_points=ArrayObject(quads),
-        highlight_color=color,
+        highlight_color=match.color,
         printing=True,
     )
     writer.add_annotation(page_number=match.page - 1, annotation=annotation)
@@ -397,7 +433,7 @@ def _same_file(a: Path, b: Path) -> bool:
 def highlight_pdf(
     input_pdf: PdfSource,
     output_pdf: PdfSink,
-    keywords: Union[str, Iterable[str]],
+    keywords: KeywordsArg,
     *,
     color: str = DEFAULT_COLOR,
     ignore_case: bool = False,
@@ -412,9 +448,17 @@ def highlight_pdf(
             ファイルオブジェクトは現在位置から最後まで読み込む。
         output_pdf: 出力先。パス、書き込み可能なバイナリのファイルオブジェクト、
             または ``None``(``result.data`` にバイト列を返す)。
-        keywords: 検索する文字列(1 つの str か、str の反復可能オブジェクト)。
+        keywords: 検索する文字列。次のいずれか。
+
+            * 1 つの str、または str の反復可能オブジェクト(すべて ``color`` で付与)
+            * ``{"語": "blue", "語2": "yellow"}`` のようなキーワード→色の dict
+            * ``[("語", "blue"), "語2"]`` のような str と (str, 色) の混在リスト
+              (色の無い語は ``color`` で付与)
+
             空白・改行は無視して照合するため、行をまたぐ文字列も検索できる。
-        color: ハイライト色。``"FFFF00"`` / ``"#FFFF00"`` / ``"yellow"`` など。
+            同じ語に異なる色を指定すると ValueError。
+        color: 色を個別指定しなかったキーワードの色。``"FFFF00"`` / ``"#FFFF00"`` /
+            ``"yellow"`` など(色名は yellow/green/cyan/pink/orange/red/blue/purple)。
         ignore_case: True なら英字の大文字小文字を区別しない。
         cross_page: True ならページをまたぐ文字列も検索する。
             既定(False)はページ単位で検索する。
@@ -433,8 +477,7 @@ def highlight_pdf(
         PdfPasswordError: パスワードが必要、または誤っている。
         PdfHighlightError: PDF として読み込めない場合など。
     """
-    kw_list = _normalize_keywords(keywords)
-    color_hex = _parse_color(color)
+    specs = _normalize_keywords(keywords, color)
 
     out_path: Optional[Path] = None
     if isinstance(output_pdf, (str, os.PathLike)):
@@ -471,7 +514,7 @@ def highlight_pdf(
     except Exception as e:  # pdfminer は多様な例外を出すためここでまとめて変換する
         raise PdfHighlightError(f"PDF のテキストを解析できません: {e}") from e
 
-    result = HighlightResult(keywords=tuple(kw_list))
+    result = HighlightResult(keywords=tuple(kw for kw, _ in specs), colors=dict(specs))
     result.pages_without_text = [i + 1 for i, gs in enumerate(page_glyphs) if not gs]
     if result.pages_without_text:
         logger.warning(
@@ -486,18 +529,18 @@ def highlight_pdf(
         else [_build_sequence([gs], ignore_case) for gs in page_glyphs]
     )
 
-    for kw in kw_list:
+    for kw, kw_color in specs:
         key = _fold_keyword(kw, ignore_case)
         occurrence = 0
         for seq in sequences:
-            found, occurrence = _find_matches(seq, kw, key, occurrence, geometries)
+            found, occurrence = _find_matches(seq, kw, key, kw_color, occurrence, geometries)
             result.matches.extend(found)
         logger.debug("keyword=%r: %d 件", kw, occurrence)
 
     # --- 注釈の書き込み ---
     writer = PdfWriter(clone_from=reader)
     for m in result.matches:
-        _add_annotation(writer, m, color_hex)
+        _add_annotation(writer, m)
 
     buf = io.BytesIO()
     writer.write(buf)
@@ -535,13 +578,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="PDF 内の指定文字列をハイライトします(改行またぎ・日本語対応、横書きのみ)。",
     )
     p.add_argument("input", help="入力 PDF ファイル")
-    p.add_argument("keywords", nargs="*", metavar="keyword", help="ハイライトする文字列(複数可)")
+    p.add_argument("keywords", nargs="*", metavar="keyword",
+                   help="ハイライトする文字列(複数可)。色は -c で指定した色")
+    p.add_argument("-s", "--highlight", nargs=2, action="append", default=[],
+                   metavar=("COLOR", "KEYWORD"),
+                   help="色を指定してハイライトする文字列。何度でも指定可(例: -s blue 吾輩 -s yellow 猫)")
     p.add_argument("-k", "--keywords-file", metavar="FILE",
-                   help="キーワードを 1 行 1 語で書いたテキストファイル(UTF-8)。空行は無視")
+                   help="キーワードを 1 行 1 語で書いたテキストファイル(UTF-8)。空行は無視。"
+                        "「キーワード<TAB>色」の行はその色で付与")
     p.add_argument("-o", "--output", metavar="FILE",
                    help="出力 PDF。省略時は <入力名>_highlighted.pdf")
     p.add_argument("-c", "--color", default=DEFAULT_COLOR,
-                   help="ハイライト色。16 進 6 桁か色名(既定: FFFF00)")
+                   help="色を個別指定しないキーワードの色。16 進 6 桁か色名(既定: FFFF00)")
     p.add_argument("-i", "--ignore-case", action="store_true", help="英字の大文字小文字を区別しない")
     p.add_argument("--cross-page", action="store_true", help="ページをまたぐ文字列も検索する")
     p.add_argument("--password", help="暗号化 PDF のパスワード")
@@ -554,12 +602,18 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _load_keywords(args: argparse.Namespace) -> list[str]:
-    kws = list(args.keywords)
+def _load_keywords(args: argparse.Namespace) -> list[tuple[str, Optional[str]]]:
+    """CLI 引数から (キーワード, 色 or None) のリストを作る。None は -c の色を使う。"""
+    specs: list[tuple[str, Optional[str]]] = [(kw, None) for kw in args.keywords]
+    specs += [(kw, col) for col, kw in args.highlight]
     if args.keywords_file:
         text = Path(args.keywords_file).read_text(encoding="utf-8-sig")
-        kws += [line.rstrip("\r\n") for line in text.splitlines() if line.strip()]
-    return kws
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            kw, sep, col = line.partition("\t")
+            specs.append((kw, (col.strip() or None) if sep else None))
+    return specs
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -606,7 +660,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(f"出力: {result.output_path}")
         for kw, n in result.counts().items():
-            print(f"  {kw!r}: {n} 件")
+            print(f"  {kw!r} ({result.colors[kw]}): {n} 件")
         if result.pages_without_text:
             print(f"注意: テキスト層の無いページ(OCR が必要): {result.pages_without_text}", file=sys.stderr)
 

@@ -140,6 +140,102 @@ def test_highlight_is_drawn_over_the_keyword(sample, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# キーワードごとの色指定
+# --------------------------------------------------------------------------- #
+def _is_yellow(p):
+    return p[0] > 200 and p[1] > 200 and p[2] < 120
+
+
+def _is_blue(p):  # 00BFFF を白地に重ねた色
+    return p[0] < 80 and p[1] > 150 and p[2] > 200
+
+
+def color_xs(img, pred):
+    """条件に合う画素の x 座標の (最小, 最大)。無ければ None。"""
+    px = img.load()
+    xs = [x for y in range(img.height) for x in range(img.width) if pred(px[x, y])]
+    return (min(xs), max(xs)) if xs else None
+
+
+def _highlight_colors(annotations) -> list[list[float]]:
+    return [[round(float(v), 2) for v in a["/C"]] for a in annotations]
+
+
+def test_per_keyword_colors_with_dict(sample, tmp_path):
+    out = tmp_path / "o.pdf"
+    res = ph.highlight_pdf(sample, out, {"どこで生れたか": "blue", "吾輩": "yellow", "存在しない": "red"})
+    assert res.counts() == {"どこで生れたか": 1, "吾輩": 2, "存在しない": 0}
+    assert res.colors == {"どこで生れたか": "00bfff", "吾輩": "ffff00", "存在しない": "ff0000"}
+    assert {m.color for m in res.matches if m.keyword == "どこで生れたか"} == {"00bfff"}
+
+    a = annots(out)
+    assert sorted(_highlight_colors(a)) == [[0.0, 0.75, 1.0], [1.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+
+    img = render(out)
+    blue, yellow = color_xs(img, _is_blue), color_xs(img, _is_yellow)
+    assert blue is not None and yellow is not None, "青と黄の両方が描画されているはず"
+
+
+def test_mixed_list_uses_default_color_for_plain_keywords(sample, tmp_path):
+    res = ph.highlight_pdf(sample, tmp_path / "o.pdf", [("吾輩", "blue"), "どこで生れたか"], color="green")
+    assert res.colors == {"吾輩": "00bfff", "どこで生れたか": "00ff00"}
+    assert {m.color for m in res.matches} == {"00bfff", "00ff00"}
+
+
+def test_same_keyword_same_color_is_deduplicated(sample, tmp_path):
+    res = ph.highlight_pdf(sample, tmp_path / "o.pdf", [("吾輩", "blue"), ("吾輩", "#00bfff")])
+    assert res.counts() == {"吾輩": 2}
+
+
+def test_same_keyword_with_different_colors_is_rejected(sample, tmp_path):
+    with pytest.raises(ValueError):
+        ph.highlight_pdf(sample, tmp_path / "o.pdf", [("吾輩", "blue"), ("吾輩", "red")])
+
+
+@pytest.mark.parametrize("bad", [[("吾輩", 1)], [("吾輩", "blue", "x")], [1], {"吾輩": "zzz"}])
+def test_invalid_color_specs(sample, tmp_path, bad):
+    with pytest.raises((ValueError, TypeError)):
+        ph.highlight_pdf(sample, tmp_path / "o.pdf", bad)
+
+
+def test_color_is_in_json_dict(sample, tmp_path):
+    d = ph.highlight_pdf(sample, tmp_path / "o.pdf", {"吾輩": "blue"}).to_dict()
+    assert d["colors"] == {"吾輩": "00bfff"}
+    assert {m["color"] for m in d["matches"]} == {"00bfff"}
+
+
+def test_cli_highlight_option_repeatable(sample, tmp_path, capsys):
+    out = tmp_path / "o.pdf"
+    code = ph.main([
+        str(sample), "Hello World", "-s", "blue", "吾輩", "-s", "FF69B4", "どこで生れたか",
+        "-c", "green", "-o", str(out), "--json",
+    ])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["colors"] == {"Hello World": "00ff00", "吾輩": "00bfff", "どこで生れたか": "ff69b4"}
+    assert len(annots(out, 0)) == 3  # 1 ページ目: 吾輩 2 + どこで生れたか 1
+    assert len(annots(out, 1)) == 1  # 2 ページ目: Hello World
+
+
+def test_cli_only_highlight_option_needs_no_positional_keyword(sample, tmp_path):
+    assert ph.main([str(sample), "-s", "blue", "吾輩", "-o", str(tmp_path / "o.pdf")]) == 0
+
+
+def test_cli_keywords_file_with_tab_separated_color(sample, tmp_path, capsys):
+    kf = tmp_path / "kw.txt"
+    kf.write_text("吾輩\tblue\n\nHello World\nどこで生れたか\t\n", encoding="utf-8")
+    code = ph.main([str(sample), "-k", str(kf), "-o", str(tmp_path / "o.pdf"), "--json"])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["colors"] == {"吾輩": "00bfff", "Hello World": "ffff00", "どこで生れたか": "ffff00"}
+
+
+def test_cli_conflicting_colors_is_error(sample, tmp_path):
+    argv = [str(sample), "-s", "blue", "吾輩", "-s", "red", "吾輩", "-o", str(tmp_path / "o.pdf")]
+    assert ph.main(argv) == 1
+
+
+# --------------------------------------------------------------------------- #
 # 座標系
 # --------------------------------------------------------------------------- #
 def _modified(sample: Path, tmp_path: Path, *, rotate: int = 0, shift: tuple[float, float] = (0, 0)) -> Path:

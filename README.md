@@ -26,14 +26,18 @@ Python 3.9 以上を想定していますが、動作確認は 3.12 のみです
 
 ```powershell
 python pdf_highlight.py 入力.pdf 吾輩 "Hello World" -o 出力.pdf
+
+# 語ごとに色を変える(-s を何度でも指定できる)
+python pdf_highlight.py 入力.pdf -s blue 吾輩 -s yellow 猫 -s FF69B4 "Hello World" -o 出力.pdf
 ```
 
 | オプション | 説明 |
 |---|---|
-| `keyword ...` | ハイライトする文字列(複数可) |
-| `-k, --keywords-file FILE` | キーワードを 1 行 1 語で書いた UTF-8 テキスト |
+| `keyword ...` | ハイライトする文字列(複数可)。色は `-c`(既定は黄) |
+| `-s, --highlight COLOR KEYWORD` | 色を指定してハイライトする文字列。何度でも指定可 |
+| `-k, --keywords-file FILE` | キーワードを 1 行 1 語で書いた UTF-8 テキスト。`キーワード<TAB>色` の行はその色で付与 |
 | `-o, --output FILE` | 出力先。省略時は `<入力名>_highlighted.pdf` |
-| `-c, --color` | 色。16 進 6 桁か色名(yellow/green/cyan/pink/orange/red)。既定 `FFFF00` |
+| `-c, --color` | 色を個別指定しない語の色。16 進 6 桁か色名。既定 `FFFF00` |
 | `-i, --ignore-case` | 英字の大文字小文字を区別しない |
 | `--cross-page` | ページをまたぐ文字列も検索する |
 | `--password` | 暗号化 PDF のパスワード(出力は暗号化されない) |
@@ -41,6 +45,18 @@ python pdf_highlight.py 入力.pdf 吾輩 "Hello World" -o 出力.pdf
 | `--fail-on-no-match` | 一致 0 件なら終了コード 3 にする |
 | `--json` | 結果を JSON で標準出力に出す |
 | `-v` | 詳細ログ |
+
+色名: `yellow`(FFFF00)/ `green`(00FF00)/ `cyan`(00FFFF)/ `pink`(FF69B4)/ `orange`(FFA500)/
+`red`(FF0000)/ `blue`(00BFFF)/ `purple`(DA70D6)。`blue` は文字が読めるよう明るい青にしています。
+濃い青などは 16 進で指定してください。同じ語に異なる色を指定するとエラーになります。
+
+キーワードファイルの例(色の区切りは TAB。色の無い行は `-c` の色):
+
+```text
+吾輩	blue
+猫	yellow
+Hello World
+```
 
 終了コード: `0` 成功 / `1` エラー / `2` 引数エラー / `3` 一致なし(`--fail-on-no-match` 時のみ)
 
@@ -56,7 +72,12 @@ except PdfHighlightError as e:
 print(result.counts())   # {'吾輩': 3, 'Hello World': 1}
 print(result.total)      # 4
 for m in result.matches: # 注釈ごとの情報(ページ番号は 1 始まり、rects は PDF 座標)
-    print(m.keyword, m.page, m.rects)
+    print(m.keyword, m.page, m.rects, m.color)
+
+# 語ごとに色を指定する(dict、または str と (str, 色) の混在リスト)
+highlight_pdf("in.pdf", "out.pdf", {"吾輩": "blue", "猫": "yellow"})
+highlight_pdf("in.pdf", "out.pdf", [("吾輩", "blue"), "猫"], color="green")  # 猫は green
+print(result.colors)     # {'吾輩': '00bfff', '猫': '00ff00'}
 ```
 
 - 入力は **パス / bytes / バイナリのファイルオブジェクト**、出力は **パス / ファイルオブジェクト / `None`**
