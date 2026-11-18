@@ -329,7 +329,8 @@ def test_config_from_env(tmp_path):
 
 def test_tool_definitions_are_wellformed_and_flat():
     names = [t["name"] for t in tools.TOOL_DEFINITIONS]
-    assert names == ["pdf_inspect", "pdf_search", "pdf_highlight"] and set(names) == set(tools._HANDLERS)
+    assert names == ["pdf_inspect", "pdf_read_text", "pdf_search", "pdf_highlight"]
+    assert set(names) == set(tools._HANDLERS)
     blob = json.dumps(tools.TOOL_DEFINITIONS)
     assert "oneOf" not in blob and "anyOf" not in blob, "ホスト互換のため oneOf/anyOf を使わない"
     for t in tools.TOOL_DEFINITIONS:
@@ -337,5 +338,7 @@ def test_tool_definitions_are_wellformed_and_flat():
         assert set(t["input_schema"]["required"]) <= set(t["input_schema"]["properties"])
     props = {t["name"]: set(t["input_schema"]["properties"]) for t in tools.TOOL_DEFINITIONS}
     assert props["pdf_search"] == tools._SEARCH_KEYS and props["pdf_highlight"] == tools._HIGHLIGHT_KEYS
+    assert props["pdf_read_text"] == tools._READ_KEYS
+    assert tools.TOOL_DEFINITIONS[1]["input_schema"]["required"] == ["input", "pages"], "pages は必須(全文ダンプを防ぐ)"
     item_props = set(tools._ITEM_SCHEMA["properties"])
     assert item_props == tools._ITEM_KEYS

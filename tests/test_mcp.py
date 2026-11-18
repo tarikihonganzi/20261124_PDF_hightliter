@@ -66,9 +66,10 @@ def test_list_tools(work):
 
     res = run_session(work, scenario)
     by_name = {t.name: t for t in res.tools}
-    assert set(by_name) == {"pdf_inspect", "pdf_search", "pdf_highlight"}
+    assert set(by_name) == {"pdf_inspect", "pdf_read_text", "pdf_search", "pdf_highlight"}
     assert by_name["pdf_search"].annotations.read_only_hint is True
     assert by_name["pdf_inspect"].annotations.read_only_hint is True
+    assert by_name["pdf_read_text"].annotations.read_only_hint is True
     assert by_name["pdf_highlight"].annotations.read_only_hint is False
     assert by_name["pdf_highlight"].annotations.destructive_hint is False
     schema = by_name["pdf_highlight"].input_schema
@@ -92,6 +93,19 @@ def test_search_then_highlight_over_mcp(work):
     assert out.exists() and len(PdfReader(str(out)).pages[0]["/Annots"]) == 1
     box, dark = yellow_bbox(render(out))
     assert box is not None and dark > 50
+
+
+def test_read_text_over_mcp(work):
+    """目次で当たりを付け、必要なページだけ読む流れが MCP 越しに通る。"""
+
+    async def scenario(s):
+        info = await s.call_tool("pdf_inspect", {"input": "sample.pdf", "page_heads": True})
+        text = await s.call_tool("pdf_read_text", {"input": "sample.pdf", "pages": [2]})
+        return parse(info), parse(text)
+
+    info, text = run_session(work, scenario)
+    assert [h["page"] for h in info["document"]["page_heads"]] == [1, 2]
+    assert text["ok"] and text["text"].startswith("[p.2]\nHello World.") and text["pages"] == [2]
 
 
 def test_errors_are_flagged_and_structured(work, tmp_path):

@@ -212,12 +212,14 @@ def _open(path: Path, args: Mapping, cfg: ToolConfig) -> core.PdfDocument:
 # ツール本体
 # --------------------------------------------------------------------------- #
 def _tool_inspect(args: dict, cfg: ToolConfig) -> dict:
-    _check_keys(args, {"input", "password"}, "引数")
+    _check_keys(args, {"input", "outline", "page_heads", "password"}, "引数")
+    want_outline = _bool(args, "outline", False)
+    want_heads = _bool(args, "page_heads", False)
     path = _input_path(args, cfg)
     with _open(path, args, cfg) as doc:
-        empty = doc.pages_without_text()
+        empty, heads, heads_truncated = doc.scan_pages(heads=want_heads)
         layer = "none" if len(empty) == doc.page_count else "partial" if empty else "full"
-        return {"document": {
+        info: dict = {
             "fingerprint": doc.fingerprint,
             "pages": doc.page_count,
             "size_bytes": path.stat().st_size,
@@ -225,7 +227,50 @@ def _tool_inspect(args: dict, cfg: ToolConfig) -> dict:
             "text_layer": layer,  # full / partial / none(none はスキャン画像のみ。OCR が必要)
             "pages_without_text": empty[:50],
             "highlights": doc.highlight_counts(),
-        }}
+        }
+        if want_outline:
+            info["outline"], truncated = doc.outline()  # 目次(しおり)。無ければ空
+            if truncated:
+                info["outline_truncated"] = True
+        if want_heads:
+            info["page_heads"] = heads  # 各ページの最初の行
+            if heads_truncated:
+                info["page_heads_truncated"] = True
+        return {"document": info}
+
+
+_READ_KEYS = {"input", "pages", "max_chars", "offset", "password"}
+
+
+def _tool_read_text(args: dict, cfg: ToolConfig) -> dict:
+    _check_keys(args, _READ_KEYS, "引数")
+    pages = _pages(args)
+    if pages is None:
+        raise _bad("pages は必須です(読むページを指定してください)",
+                   "pdf_inspect の outline や page_heads で読むページを選ぶか、pdf_search で語を探してください")
+    if len(pages) > 50:
+        raise _bad("pages は 50 ページまでにしてください", "続きは offset で取れます")
+    max_chars = _int(args, "max_chars", 4000, 200, 20000)
+    offset = _int(args, "offset", 0, 0, 10**9)
+    path = _input_path(args, cfg)
+    with _open(path, args, cfg) as doc:
+        res = doc.read_text(pages, max_chars=max_chars, offset=offset)
+        if len(res.empty_pages) == len(res.pages):
+            raise ToolError("no_text_layer", "指定したページにテキスト層がありません(スキャン画像の可能性)",
+                            "OCR をかけた PDF を使ってください")
+        out: dict = {
+            "document": {"fingerprint": doc.fingerprint, "pages": doc.page_count},
+            "text": res.text,
+            "pages": res.pages,
+            "offset": res.offset,
+            "total_chars": res.total_chars,
+        }
+        if res.next_offset is not None:
+            # 続きは、同じ pages と、この offset を渡して取る(状態は持たない)
+            out["next_offset"] = res.next_offset
+        if res.empty_pages:
+            out["warnings"] = [f"no_text_layer: テキスト層の無いページ: {res.empty_pages[:20]}"]
+        return out
 
 
 _SEARCH_KEYS = {"input", "queries", "mode", "min_score", "ignore_case", "pages", "limit", "context_chars", "password"}
@@ -312,6 +357,7 @@ def _tool_highlight(args: dict, cfg: ToolConfig) -> dict:
 
 _HANDLERS: dict[str, Callable[[dict, ToolConfig], dict]] = {
     "pdf_inspect": _tool_inspect,
+    "pdf_read_text": _tool_read_text,
     "pdf_search": _tool_search,
     "pdf_highlight": _tool_highlight,
 }
@@ -409,12 +455,46 @@ TOOL_DEFINITIONS: list[dict] = [
             "PDF の基本情報(ページ数・暗号化・テキスト層の有無・既存ハイライト数・内容のハッシュ)を返す(読み取り専用)。"
             "ハイライトを付ける前に、PDF が文字を持つ(スキャン画像だけでない)か確かめたいときに使う。"
             "text_layer が none の PDF は検索も付与もできない(OCR が必要)。"
+            "PDF の内容を知らず、どこを読めばよいか分からないときは、outline(目次)や page_heads(各ページの最初の行)を"
+            "付けて呼び、読むページを選んでから pdf_read_text を使う(全ページの本文を読むより遥かに少ない量で済む)。"
+            + _UNTRUSTED
         ),
         "input_schema": {
             "type": "object",
             "required": ["input"],
             "properties": {
                 "input": {"type": "string", "description": "入力 PDF のパス"},
+                "outline": {"type": "boolean", "default": False,
+                            "description": "true なら目次(しおり)を返す。しおりの無い PDF では空"},
+                "page_heads": {"type": "boolean", "default": False,
+                               "description": "true なら各ページの最初の行を返す(見出しやヘッダのことが多い)。最大 200 ページ分"},
+                "password": {"type": "string", "description": "暗号化 PDF のとき。ユーザーが提供した場合のみ使う"},
+            },
+        },
+        "read_only": True,
+    },
+    {
+        "name": "pdf_read_text",
+        "description": (
+            "指定したページの本文を、ページ番号付き・行ごとの文字列で返す(読み取り専用)。"
+            "PDF の内容を知らないまま語を決められないときに、該当しそうなページだけを読むために使う。"
+            "全文を読むためのツールではない: pages は必須で、1 回の応答は max_chars(既定 4000 文字)で区切られる。"
+            "先に pdf_inspect の outline / page_heads で読むページを絞るか、語が分かっているなら pdf_search を使うこと。"
+            "続きがあるときは next_offset が返るので、同じ pages と offset=next_offset を渡して続きを取る。"
+            "本文から語を引用して pdf_highlight や pdf_search に渡せる(空白・改行・全角半角の違いは照合側が吸収する)。"
+            + _UNTRUSTED
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["input", "pages"],
+            "properties": {
+                "input": {"type": "string", "description": "入力 PDF のパス"},
+                "pages": {"type": "array", "minItems": 1, "maxItems": 50,
+                          "items": {"type": "integer", "minimum": 1}, "description": "読むページ(1 始まり)"},
+                "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 4000,
+                              "description": "1 回の応答の最大文字数"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0,
+                           "description": "続きを取るときに、前回の next_offset を渡す(pages は前回と同じにする)"},
                 "password": {"type": "string", "description": "暗号化 PDF のとき。ユーザーが提供した場合のみ使う"},
             },
         },
@@ -426,7 +506,8 @@ TOOL_DEFINITIONS: list[dict] = [
             "PDF 内の文字列を検索し、前後の文脈付きの候補を返す(読み取り専用。PDF は変更しない)。"
             "ハイライトを付ける前に、語が PDF の文字列と一致するか・何か所あるかを確かめたいときに使う。"
             "mode=fuzzy(既定)は、誤字・一部欠落など少しずれた語にも近い箇所を返す。"
-            "ただし言い換え・要約には一致しない(その場合は PDF の本文を読んで、実際の文字列で検索すること)。"
+            "ただし言い換え・要約には一致しない(その場合は pdf_inspect の outline で当たりを付け、pdf_read_text で本文を読み、"
+            "実際の文字列で検索すること)。"
             "各候補の ref は自己完結の位置指定で、そのまま pdf_highlight の items に渡せる。"
             "結果を別の主体に伝える場合も、ref を含めること(このツールも pdf_highlight も呼び出し間の状態を持たない)。"
             + _UNTRUSTED

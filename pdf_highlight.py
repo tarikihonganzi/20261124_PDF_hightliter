@@ -67,6 +67,7 @@ __all__ = [
     "Candidate",
     "SearchResult",
     "HighlightReport",
+    "ReadResult",
     "highlight_pdf",
     "main",
 ]
@@ -384,20 +385,33 @@ def _line_rects(glyphs: Sequence[_Glyph], geo: _PageGeometry) -> list[Rect]:
 
     行のまとめは表示座標で行い、最後に注釈用の座標系へ変換する。
     """
-    lines: list[list[float]] = []  # [x0, top, x1, bottom, last_x0]
+    return [
+        _displayed_to_user_space(
+            geo,
+            min(g.x0 for g in ln), min(g.top for g in ln), max(g.x1 for g in ln), max(g.bottom for g in ln),
+        )
+        for ln in _group_lines(glyphs)
+    ]
+
+
+def _group_lines(glyphs: Sequence[_Glyph]) -> list[list[_Glyph]]:
+    """読み順に並んだ文字を行ごとにまとめる(横書き前提)。
+
+    直前の行と縦位置が重なり、かつ x が戻っていなければ同じ行。矩形の計算と本文の取得で共通。
+    """
+    lines: list[list[_Glyph]] = []
+    bounds: list[list[float]] = []  # 行ごとの [top, bottom, 最後の x0]
     for g in glyphs:
         cy = (g.top + g.bottom) / 2
         if lines:
-            ln = lines[-1]
-            if ln[1] <= cy <= ln[3] and g.x0 >= ln[4] - _LINE_X_TOLERANCE:
-                ln[0] = min(ln[0], g.x0)
-                ln[1] = min(ln[1], g.top)
-                ln[2] = max(ln[2], g.x1)
-                ln[3] = max(ln[3], g.bottom)
-                ln[4] = g.x0
+            b = bounds[-1]
+            if b[0] <= cy <= b[1] and g.x0 >= b[2] - _LINE_X_TOLERANCE:
+                lines[-1].append(g)
+                b[0], b[1], b[2] = min(b[0], g.top), max(b[1], g.bottom), g.x0
                 continue
-        lines.append([g.x0, g.top, g.x1, g.bottom, g.x0])
-    return [_displayed_to_user_space(geo, ln[0], ln[1], ln[2], ln[3]) for ln in lines]
+        lines.append([g])
+        bounds.append([g.top, g.bottom, g.x0])
+    return lines
 
 
 def _find_matches(
@@ -647,12 +661,54 @@ def _clean(text: str) -> str:
 
 
 def _shorten(text: str, limit: int = _DISPLAY_MAX) -> str:
-    return text if len(text) <= limit else text[:40] + "…" + text[-40:]
+    """limit 文字を超えるとき、先頭と末尾を残して中略する(結果は limit 文字以内)。"""
+    if len(text) <= limit:
+        return text
+    half = max((limit - 1) // 2, 1)
+    return text[:half] + "…" + text[-half:]
+
+
+_WORD_GAP_RATIO = 0.2  # 文字間の隙間が文字の高さのこの割合を超えたら、語の区切りとして空白を補う
+
+
+def _is_wide(ch: str) -> bool:
+    return unicodedata.east_asian_width(ch) in ("W", "F")
+
+
+def _line_text(line: Sequence[_Glyph]) -> str:
+    """1 行分の文字を本文にする。
+
+    PDF によっては語の間に空白の文字が無く、位置の隙間だけで表している。そのため隙間が大きいところには
+    空白を補う(日本語など幅の広い文字の間には補わない)。
+    """
+    out: list[str] = []
+    prev: Optional[_Glyph] = None
+    for g in line:
+        if (prev is not None and prev.text and g.text and not prev.text[-1].isspace() and not g.text[0].isspace()
+                and not _is_wide(prev.text[-1]) and not _is_wide(g.text[0])
+                and g.x0 - prev.x1 > _WORD_GAP_RATIO * max(g.bottom - g.top, 0.0)):
+            out.append(" ")
+        out.append(g.text)
+        prev = g
+    return "".join(out)
+
+
+def _join_glyphs(glyphs: Sequence[_Glyph]) -> str:
+    """文字の列を 1 本の文字列にする。行のつなぎ目は、英文など幅の狭い文字どうしのときだけ空白を入れる
+    (日本語は行をまたいでも空白を入れない)。制御文字の除去などは ``_clean`` で行う。"""
+    out = ""
+    for ln in _group_lines(glyphs):
+        text = _line_text(ln)
+        if out and text and not _is_wide(out[-1]) and not _is_wide(text[0]) \
+                and not out[-1].isspace() and not text[0].isspace():
+            out += " "
+        out += text
+    return out
 
 
 def _span_text(glyphs: Sequence[_Glyph], ids: Sequence[int]) -> str:
-    """一致範囲の表示用文字列。範囲の途中にある空白グリフも含める(照合では無視される空白)。"""
-    return _clean("".join(g.text for g in glyphs[ids[0] : ids[-1] + 1]))
+    """一致範囲の表示用文字列。範囲の途中にある空白も含める(照合では無視される空白)。"""
+    return _clean(_join_glyphs(glyphs[ids[0] : ids[-1] + 1]))
 
 
 def _fuzzy_spans(text: str, key: str, min_score: int) -> list[tuple[int, int, int]]:
@@ -741,6 +797,16 @@ class SearchResult:
 
 
 @dataclass
+class ReadResult:
+    text: str
+    pages: list[int]  # 対象にしたページ(1 始まり、昇順)
+    total_chars: int  # 選んだページ全体の文字数
+    offset: int
+    next_offset: Optional[int] = None  # 続きがあるとき、次に渡す offset
+    empty_pages: list[int] = field(default_factory=list)  # テキスト層の無いページ
+
+
+@dataclass
 class HighlightReport:
     results: list[dict] = field(default_factory=list)  # 項目ごとの結果(status 付き)
     applied: int = 0  # 注釈を付けた項目数
@@ -805,7 +871,8 @@ class PdfDocument:
         if self.deadline is not None and time.monotonic() > self.deadline:
             raise PdfTimeoutError("処理時間の上限を超えました")
 
-    def _page(self, index: int) -> tuple[list[_Glyph], _PageGeometry]:
+    def _page(self, index: int, keep: bool = True) -> tuple[list[_Glyph], _PageGeometry]:
+        """ページの文字と座標情報。``keep=False`` なら、抽出結果をメモに残さない(全ページを順に走査する用)。"""
         self._check_deadline()
         if index not in self._pages:
             try:
@@ -815,11 +882,14 @@ class PdfDocument:
                         raise PdfHighlightError(
                             f"ページ数が一致しません(pdfplumber={len(self._plumber.pages)}, pypdf={self.page_count})"
                         )
-                self._pages[index] = _extract_page(self._plumber, index, self._mediaboxes[index])
+                page = _extract_page(self._plumber, index, self._mediaboxes[index])
             except PdfHighlightError:
                 raise
             except Exception as e:  # pdfminer は多様な例外を出すためここでまとめて変換する
                 raise PdfHighlightError(f"PDF のテキストを解析できません: {e}") from e
+            if not keep:
+                return page
+            self._pages[index] = page
         return self._pages[index]
 
     def _seq(self, index: int, ignore_case: bool) -> _Sequence:
@@ -838,9 +908,99 @@ class PdfDocument:
             out.append(p - 1)
         return sorted(set(out))
 
+    def scan_pages(self, heads: bool = False, heads_limit: int = 200) -> tuple[list[int], list[dict], bool]:
+        """全ページを順に走査して、(テキスト層の無いページ, 各ページの先頭行, 先頭行が省略されたか)を返す。
+
+        全ページを抽出するため、大きな PDF では時間がかかる(結果はメモに残さず、メモリは増やさない)。
+        先頭行は、そのページの最初の行(見出しやヘッダのことが多い)。目次が無い PDF で、読むページを選ぶ手がかりになる。
+        """
+        empty: list[int] = []
+        head_list: list[dict] = []
+        truncated = False
+        for i in range(self.page_count):
+            glyphs, _ = self._page(i, keep=i in self._pages)
+            if not glyphs:
+                empty.append(i + 1)
+                continue
+            if heads:
+                first = next((t for ln in _group_lines(glyphs) if (t := _clean(_line_text(ln)))), "")
+                if first:
+                    if len(head_list) < heads_limit:
+                        head_list.append({"page": i + 1, "head": _shorten(first, 40)})
+                    else:
+                        truncated = True
+        return empty, head_list, truncated
+
     def pages_without_text(self) -> list[int]:
         """テキスト層の無いページ(1 始まり)。全ページを抽出するため、大きな PDF では時間がかかる。"""
-        return [i + 1 for i in range(self.page_count) if not self._page(i)[0]]
+        return self.scan_pages()[0]
+
+    def outline(self, limit: int = 200) -> tuple[list[dict], bool]:
+        """PDF の目次(しおり)。``[{title, page, level}]`` と、``limit`` で省略したか。無ければ空。"""
+        entries: list[dict] = []
+        truncated = False
+
+        def walk(items, level: int) -> None:
+            nonlocal truncated
+            for it in items:
+                if truncated:
+                    return
+                if isinstance(it, list):
+                    walk(it, level + 1)
+                    continue
+                try:
+                    page = self._reader.get_destination_page_number(it) + 1
+                except Exception:
+                    continue  # 行き先が壊れている項目は飛ばす
+                title = _shorten(_clean(str(getattr(it, "title", "") or "")), 60)
+                if not title or not 1 <= page <= self.page_count:
+                    continue
+                if len(entries) >= limit:
+                    truncated = True
+                    return
+                entries.append({"title": title, "page": page, "level": level})
+
+        try:
+            walk(self._reader.outline, 1)
+        except Exception:
+            return [], False
+        return entries, truncated
+
+    def read_text(self, pages: Iterable[int], *, max_chars: int = 4000, offset: int = 0) -> "ReadResult":
+        """指定ページの本文を、行ごとに改行した文字列で返す。全文を一度に返さず、文字数の予算で区切る。
+
+        各ページの先頭に ``[p.N]`` の行を付ける。``max_chars`` に収まらないときは行の切れ目で区切り、
+        ``next_offset`` を返す(続きは、同じ ``pages`` と ``offset=next_offset`` で取る)。
+        ページの並びは昇順・重複なしにそろえる。
+        """
+        idx = self._page_indexes(pages)
+        if not idx:
+            raise ValueError("pages は 1 つ以上指定してください")
+        if not 1 <= max_chars <= 20000:
+            raise ValueError("max_chars は 1〜20000 で指定してください")
+        parts: list[str] = []
+        empty: list[int] = []
+        for p in idx:
+            glyphs, _ = self._page(p, keep=p in self._pages)
+            lines = [t for ln in _group_lines(glyphs) if (t := _clean(_line_text(ln)))]
+            if lines:
+                parts.append(f"[p.{p + 1}]\n" + "\n".join(lines))
+            else:
+                empty.append(p + 1)
+                parts.append(f"[p.{p + 1}] (テキストなし)")
+        full = "\n".join(parts)
+        total = len(full)
+        if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= total:
+            raise ValueError(f"offset は 0〜{total}(選んだページの本文の長さ)で指定してください")
+        end = min(offset + max_chars, total)
+        if end < total:
+            cut = full.rfind("\n", offset, end)
+            if cut >= offset + max_chars * 0.6:
+                end = cut + 1  # 行の途中で切らない(予算の 6 割以上を使えるときだけ)
+        return ReadResult(
+            text=full[offset:end], pages=[p + 1 for p in idx], total_chars=total, offset=offset,
+            next_offset=end if end < total else None, empty_pages=empty,
+        )
 
     def highlight_counts(self) -> dict[str, int]:
         """既存のハイライト注釈の数。``ours`` はこのモジュールが付けたもの(/NM が pdfhl: で始まる)。"""
@@ -891,8 +1051,8 @@ class PdfDocument:
         first, last, n = hit.ids[0], hit.ids[-1], context_chars
         before = after = ""
         if n > 0:
-            before = _clean("".join(g.text for g in glyphs[max(0, first - 3 * n - 3) : first]))[-n:]
-            after = _clean("".join(g.text for g in glyphs[last + 1 : last + 1 + 3 * n + 3]))[:n]
+            before = _clean(_join_glyphs(glyphs[max(0, first - 3 * n - 3) : first]))[-n:]
+            after = _clean(_join_glyphs(glyphs[last + 1 : last + 1 + 3 * n + 3]))[:n]
         ratio = glyphs[first].top / geo.disp_h if geo.disp_h else 0.0
         position = "upper" if ratio < 1 / 3 else "middle" if ratio < 2 / 3 else "lower"
         return Candidate(
